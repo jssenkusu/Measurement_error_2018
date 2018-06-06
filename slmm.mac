@@ -1,0 +1,793 @@
+/*------------------------------------------------------------------*/
+/*                                                                  */
+/*                           Macro SLMM                             */
+/*                                                                  */
+/*                          Daowen Zhang                            */
+/*                     Department of Statistics                     */
+/*                   North Carolina State University                */
+/*                      Raleigh, NC 27695-8203                      */
+/*                                                                  */
+/*     This macro fits a linear mixed model with flexible           */
+/*  distribution for the random intercept for longitudinal or       */
+/*  clustered data. The random effect distribution is estimated     */
+/*  via SNP approach where "kz" in the macro is to control the      */
+/*  the flexiblility of the distribution.                           */
+/*                                                                  */
+/*     The definition of the macro input:                           */
+/*                                                                  */
+/*  data    = name of the data set                                  */ 
+/*  dep     = dependent variable (Y)                                */
+/*  xvar    = fixed effect covariates (X)                           */
+/*  id      = id indicator for each cluster                         */
+/*  kz      = order of the polynomial in SNP density to control     */
+/*            the flexibility of the distribution; default=2        */
+/*  print   = flag for printing output                              */
+/*  method  = method used to get initial estimates; 1) gs: grid     */
+/*            search for SNP paramters; 2) pl: penalized likelihood */
+/*            to find initial estimates                             */
+/*  gridpt  = number of grid points for angles if method=gs         */
+/*  parm    = initial values for the paramters; order is: beta for  */
+/*            fixed effects (no intercept), angles, mu, sigb, sige  */
+/*  outparm = data set to output the parameter estimates            */
+/*  outstd  = data set to output the se of parameter estimates      */
+/*  outrand = data set to output the random effect and its se       */
+/*  outmarg = data set to output the marginal density               */
+/*                                                                  */
+/*  An example:                                                     */
+/*                                                                  */
+/*  %include "slmm.mac";                                            */
+/*                                                                  */
+/*  %slmm(data=sim, dep=y, xvar=x, kz=2, id=id, print=Y,            */
+/*       method=pl, gridpt=4, outrand=rand, outmarg=marg);          */
+/*                                                                  */
+/* proc print data=rand;                                            */
+/* run;                                                             */
+/*                                                                  */
+/* proc plot data=marg;                                             */
+/*   plot y*x;                                                      */
+/* run;                                                             */
+/*                                                                  */
+/********************************************************************/
+
+
+%macro slmm(data=, dep=, xvar=, id=, kz=, print=Y, method=, gridpt=,
+       parm=, outparm=, outstd=, outrand=, outmarg=);
+
+options ls=72 ps=60 replace;
+
+%let stop=0;
+
+%if (%length(&data)=0) %then %do;
+ %put ERROR: DATA is not provided.;
+ %let stop = 1;
+%end;
+
+%if (%length(&dep)=0) %then %do;
+ %put ERROR: Dependent variable DEP is not provided.;
+ %let stop = 1;
+%end;
+
+%if (%length(&id)=0) %then %do;
+ %put ERROR: ID is not provided.;
+ %let stop = 1;
+%end;
+
+%if &stop >0 %then %do; 
+ %put NOTE: Macro SLMM stopped because of errors!;
+ %goto done;
+%end;
+
+%let _space = %str(); 
+%let method=%upcase(&method);
+%if (&method=GS) and (%length(&gridpt)=0) %then
+ %let gridpt=5; 
+
+%let print=%upcase(&print);
+%if %length(&print)=0 %then
+ %let print=Y;
+ 
+%if %length(&kz)=0 %then
+%let kz=2;
+
+%let nb=0;
+%do i=1 %to 50;
+  %let temp = %qscan(&xvar, &i, %str( ));
+  %if &temp=%str( ) %then %goto done1;
+  %let nb=%eval(&nb+1);
+%end;
+%done1: ;
+
+%let npm=0;
+%do i=1 %to 50;
+  %let temp = %qscan(&parm, &i, %str( ));
+  %if &temp=%str( ) %then %goto done2;
+  %let npm=%eval(&npm+1);
+%end;
+%done2: ;
+
+%let np=%eval(&nb+&kz+3);
+
+data _setup_; set &data;
+run;
+
+proc sort data=_setup_;
+  by &id;
+run;
+
+data _junk_; set _setup_;
+  by &id;
+  if first.&id=1;
+  keep &id;
+run;
+
+data _junk_; set _junk_;
+  _id_ = _N_;
+run;
+
+data _setup_; merge _setup_ _junk_;
+  by &id;
+run;
+ 
+%if &np ne &npm %then %do;
+ ods listing close;
+ Proc Mixed Method=ML;
+ Class &id;
+ Model &dep = &xvar / s;
+ Random intercept / subject=&id;
+ ODS output SolutionF=fixed;
+ ODS output covparms=covpm;
+ run;
+ ods listing;
+
+ Data fixed; set fixed;
+  keep estimate;
+ run;
+
+ data covpm; set covpm;
+  keep estimate;
+ run;
+%end;
+
+proc iml; /* symsize=&symsize worksize=&worksize; */
+
+start getparm(parm,halfpi);
+  parm = j(&np, 1, 0);
+  %if &npm=&np %then
+  %do i=1 %to &np;
+    parm[&i] = %qscan(&parm, &i, %str( ));
+  %end;
+  %else %do;
+   use fixed; setin fixed;
+   read all var{estimate} into beta;
+   use covpm; setin covpm;
+   read all var{estimate} into varcomp; 
+  
+   if &nb>0 then
+    parm[1:&nb] = beta[2:(&nb+1)];
+   if &kz>0 then  
+    parm[&nb+1: &nb+&kz]=0;
+
+   parm[&np-2] = beta[1];
+   parm[&np] = sqrt(varcomp[2]);
+   parm[&np-1] = sqrt(varcomp[1])/parm[&np];
+  %end;
+finish;
+
+start getdata(dep, %if &nb>0 %then %str(xvar,); 
+      npat, nobs, niobs, ystart, yend, id);
+  use _setup_; setin _setup_;
+  read all var{&dep} into dep;
+
+  %if &nb>0 %then 
+    %str(read all var{&xvar} into xvar;);
+  read all var{_id_} into id;
+  id=id//0;
+  nobs = nrow(dep);
+
+  i=1; npat=0;
+  do while (i <= nobs);
+    start=i;
+    do while ((id[i]=id[start]) & (i<=nobs));
+      i=i+1;
+    end;
+    ystart=ystart//start;
+    npat=npat+1;
+  end;
+  if npat=1 then
+   yend=nobs;
+  else
+   yend = ystart[2:npat]-1//nobs;
+  niobs = 1+yend-ystart;
+
+  use _junk_; setin _junk_;
+  read all var{&id} into id;
+finish;
+
+/* function factor() returns the factorial of n */
+start factor(n);
+  y=j(n+1,1,1);
+  do i=2 to n+1;
+    y[i]= y[i-1] * (i-1);
+  end;
+  return(y);
+finish;
+
+/* returns 1, x, x^2, ..., x^n */
+start power(x, n);
+ y=j(n+1,1,1);
+ do i=2 to n+1;
+  y[i]= y[i-1] * x;
+ end;
+ return(y);
+finish;
+
+
+start combin(n,k,fact);
+ y = fact[n+1]/(fact[k+1]*fact[n-k+1]);
+ return(y);
+finish;
+
+
+start getbcoef(a, mu, sigma, fact);
+ k = nrow(a)-1;
+ b = j(k+1, 1, 0);
+ do i=0 to k;
+  temp=a[i+1];
+  do j=i+1 to k;
+   temp = temp + combin(j,i,fact) * a[j+1]*mu**(j-i);
+  end;
+  if i=1 then 
+   temp = temp*sigma;
+  else if i>1 then
+   temp = temp*sigma**i;
+  b[i+1]=temp;
+ end;
+ return(b);
+finish;
+
+
+/* function even() returns whether or not n is even */
+start even(n);
+  flag = mod(n+1,2);
+  return(flag);
+finish;
+
+/* holds (E(Z^i) for i=0, 1,.., k for Z ~ N(0,1) */
+start Expzp(k); 
+ fn = factor(k);
+ zp = j(K+1,1,0);
+ do i=0 to k;
+  if even(i) then 
+   zp[i+1] = fn[i+1]/(2**(i/2)*fn[i/2+1]);
+ end;
+
+ return(zp); 
+finish;
+
+start getmat(Amat, Bmat, Binv, Ezp);
+ dim = &kz+1;
+ Amat=j(dim, dim, 0);
+
+ do i=1 to dim;
+  do j=i to dim;
+   Amat[i,j]=ezp[i+j-1];
+   if j>i then 
+   Amat[j,i]=Amat[i,j];
+  end;
+ end;
+
+ call eigen(m, e, Amat);
+ singval = sqrt(m);
+ Bmat = e * diag(singval) * e`;
+ Binv = e * diag(1/singval) * e`;
+finish;
+
+start getacoef(binv, angle);
+ c = j(&kz+1, 1, 1);
+ do i=2 to &kz+1;
+  c[i] = c[i-1]*cos(angle[i-1]);
+ end;
+
+ do i=1 to &kz;
+  c[i] = c[i]*sin(angle[i]);
+ end;
+
+ coef = Binv*c;
+ return(coef);
+finish;
+
+start getangle(bmat, acoef);
+ angle = j(&kz,1,1);
+ c = bmat*acoef; 
+ c = c /sqrt(c`*c);
+ do i=1 to &kz;
+  do j=1 to (i-1);
+   c[i]=c[i]/cos(angle[j]);
+  end;
+  angle[i] = arsin(c[i]);
+ end;
+ return(angle);
+finish;
+
+start loglik1(parm1) global(dep, binv,%if &nb>0 %then %str(xvar,); 
+      npat,ystart,yend, nobs, niobs, twopi, angle, Amat, fact);
+
+ if &nb>0 then 
+   beta=parm1[1:&nb];
+
+ if &kz=0 then
+  acoef=1;
+ else
+  acoef = getacoef(binv, angle);
+ mu = parm1[&np-&kz-2];
+
+ sige = parm1[&np-&kz];
+ sige2 = sige**2;
+ gamma=parm1[&np-&kz-1];
+ gamma2 = gamma**2;
+
+ lik=0;
+
+ do i=1 to npat;
+  yi = dep[ystart[i]:yend[i]];
+  if &nb>0 then
+   tao=mu+xvar[ystart[i]:yend[i],]*beta;
+  else
+   tao=mu;
+  y_tao = yi - tao;
+  sumyt = sum(y_tao);
+  temp = 1 + niobs[i]*gamma2;
+  lik = lik - 0.5*(log(temp) + ((y_tao)`*y_tao - sumyt**2*gamma2/temp)/sige2); 
+  mui = (gamma/(temp*sige))*sumyt;
+  sigi = 1/sqrt(temp);
+  bcoef = getbcoef(acoef, mui, sigi, fact);
+  temp = bcoef`*Amat*bcoef;
+  lik = lik + log(temp);
+ end;
+
+ lik = lik - (nobs/2)*(log(twopi) + log(sige2));
+ return(lik);
+finish;
+
+
+start loglik2(parm2) global(dep, binv,%if &nb>0 %then %str(xvar,); 
+      npat,ystart,yend, nobs, niobs, twopi,Amat,fact);
+
+ if &nb>0 then 
+   beta=parm2[1:&nb];
+ acoef = parm2[&nb+1:&nb+&kz+1];
+ ca = acoef`*Amat*acoef;
+ 
+ mu = parm2[&np-1];
+
+ sige = parm2[&np+1];
+ sige2 = sige**2;
+ gamma=parm2[&np];
+ gamma2 = gamma**2;
+
+ lik=0;
+
+ do i=1 to npat;
+  yi = dep[ystart[i]:yend[i]];
+  if &nb>0 then
+   tao=mu+xvar[ystart[i]:yend[i],]*beta;
+  else
+   tao=mu;
+  y_tao = yi - tao;
+  sumyt = sum(y_tao);
+  temp = 1 + niobs[i]*gamma2;
+  lik = lik - 0.5*(log(temp) + ((y_tao)`*y_tao - sumyt**2*gamma2/temp)/sige2); 
+  mui = (gamma/(temp*sige))*sumyt;
+  sigi = 1/sqrt(temp);
+  bcoef = getbcoef(acoef, mui, sigi,fact);
+  temp = bcoef`*Amat*bcoef;
+  lik = lik + log(temp);
+ end;
+
+ lik = lik - (nobs/2)*(log(twopi) + log(sige2)) - nobs*(ca-1)**2;
+ return(lik);
+finish;
+
+
+start loglikhd(parm) global(dep, binv,%if &nb>0 %then %str(xvar,); 
+      npat,ystart,yend, nobs, niobs, twopi,Amat,fact);
+
+ if &nb>0 then 
+   beta=parm[1:&nb];
+
+ if &kz=0 then 
+  acoef=1; 
+ else
+  acoef = getacoef(binv, parm[&nb+1: &nb+&kz]); 
+ mu = parm[&np-2];
+
+ sige = parm[&np];
+ sige2 = sige**2;
+ gamma=parm[&np-1];
+ gamma2 = gamma**2;
+
+ lik=0;
+
+ do i=1 to npat;
+  yi = dep[ystart[i]:yend[i]];
+  if &nb>0 then
+   tao=mu+xvar[ystart[i]:yend[i],]*beta;
+  else
+   tao=mu;
+  y_tao = yi - tao;
+  sumyt = sum(y_tao);
+  temp = 1 + niobs[i]*gamma2;
+  lik = lik - 0.5*(log(temp) + ((y_tao)`*y_tao - sumyt**2*gamma2/temp)/sige2); 
+  mui = (gamma/(temp*sige))*sumyt;
+  sigi = 1/sqrt(temp);
+  bcoef = getbcoef(acoef, mui, sigi, fact);
+  temp = bcoef`*Amat*bcoef;
+  lik = lik + log(temp);
+ end;
+
+ lik = lik - (nobs/2)*(log(twopi) + log(sige2));
+ return(lik);
+finish;
+
+start bmean(lambda) global(binv, Ezp);
+ if &kz=0 then
+   a=1;
+ else
+   a = getacoef(binv, lambda[1:&kz]);
+
+ mu = lambda[&kz+1];
+ sigb = lambda[&kz+2];
+ sigb2 = sigb**2;
+
+ dim=&kz+1;
+ Am = j(dim, dim, 0);
+ do i=1 to dim;
+  do j=i to dim;
+   Am[i,j] = ezp[i+j];
+   if j>i then
+   Am[j,i] = Am[i,j];
+  end;
+ end;
+
+ zmean = a`*Am*a;
+ bm = mu + sigb*zmean;
+
+ return(bm);
+finish;
+
+start bvar(lambda) global(binv, Ezp);
+ if &kz=0 then
+   a=1;
+ else
+   a = getacoef(binv, lambda[1:&kz]);
+
+ mu = lambda[&kz+1];
+ sigb = lambda[&kz+2];
+ sigb2 = sigb**2;
+
+ dim=&kz+1;
+ Am = j(dim, dim, 0);
+
+ do i=1 to dim;
+  do j=i to dim;
+   Am[i,j] = ezp[i+j];
+   if j>i then
+   Am[j,i] = Am[i,j];
+  end;
+ end;
+ zmean = a`*Am*a;
+
+ do i=1 to dim;
+  do j=i to dim;
+   Am[i,j] = ezp[i+j+1];
+   if j>i then
+   Am[j,i] = Am[i,j];
+  end;
+ end;
+ bv = sigb2*(a`*Am*a - zmean**2);
+ return(bv);
+finish;
+
+start outvalue(parm, value, newparm, vmat, stderr) global(nobs, Binv);
+ call nlpfdd(lik, g, h, "loglikhd", parm);
+ newparm = parm;
+ newparm[&np-1] = parm[&np-1]*parm[&np];
+
+ temp = I(&np);
+ temp[&np-1,&np-1] = parm[&np];
+ temp[&np,&np-1] =  parm[&np-1];
+ vmat = - (temp)` * inv(h) * temp;
+
+ npos=sum(vecdiag(vmat)>0);
+ if npos=&np then
+  stderr = sqrt(vecdiag(vmat)); 
+ else
+  stderr = j(&np, 1, .);
+
+ sn = -lik/nobs;
+ temp = &np/nobs;
+ aic = sn + temp;
+ bic = sn + 0.5*log(nobs)*temp;
+ hq = sn + log(log(nobs))*temp;
+ value = lik // aic // bic // hq;
+ if &kz=0 then
+  a=1;
+ else 
+  a = getacoef(binv, newparm[&nb+1:&nb+&kz]);
+ value = a // value;
+finish;
+
+start gz(z) global(acoef, mui, sigi2);
+ temp1 = z;
+ pz = acoef[1];
+ do i=1 to &kz;
+  pz = pz + acoef[i+1]*temp1;
+  temp1 = temp1 * z; 
+ end;
+ y = (pz)**2 * exp(-(z-mui)**2/(2*sigi2));
+ return(y);
+finish;
+
+start outrand(value, parm) global(dep, binv,%if &nb>0 %then %str(xvar,); 
+      npat,ystart,yend, nobs, niobs, optn, acoef, mui, sigi2);
+
+ if &nb>0 then 
+   beta=parm[1:&nb];
+
+ mu = parm[&np-2];
+
+ sigb = parm[&np-1];
+ sige = parm[&np];
+ sige2 = sige**2;
+ gamma = sigb/sige;
+ gamma2 = gamma**2;
+
+ randeff = j(npat, 2, 1);
+ acoef = value[1:(&kz+1)];
+
+ do i=1 to npat;
+  yi = dep[ystart[i]:yend[i]];
+  if &nb>0 then
+   tao=mu+xvar[ystart[i]:yend[i],]*beta;
+  else
+   tao=mu;
+  y_tao = yi - tao;
+  sumyt = sum(y_tao);
+  temp = 1 + niobs[i]*gamma2;
+  mui = (gamma/(temp*sige))*sumyt;  
+  sigi2 = 1/temp; 
+  call nlpqn(rc, xr, "gz", mui, optn);
+  randeff[i,1] = mu + sigb*xr;
+  call nlpfdd(gxr, g, h, "gz", xr);
+  randeff[i,2] =  sigb/sqrt(-h/gxr);
+ end;
+ return(randeff);
+finish;
+
+
+start margin(newparm, acoef, bmean, bvar, twopi);
+ mu = newparm[&np-2];
+ sigb = newparm[&np-1];
+
+ z = -1 + 2#(0:200)`/200;
+ b = bmean + 3*sqrt(bvar)*z;
+ 
+ z = (b-mu)/sigb;
+
+ y = acoef[1];
+ temp=z;
+ do i=2 to &kz+1;
+  y = y + acoef[i]#temp;
+  temp = temp#z;
+ end;
+
+ y = (y##2 # exp(-z##2/2))/(sqrt(twopi)*sigb);
+ marg = b || y;
+ return(marg);
+finish;
+
+
+start outinfo(value, mean, meanse, var, varse) global(npat, nobs);
+ descript = &kz // npat // nobs // value;
+ cname={"VALUE"};  
+ rname={"Order of Polynomial (Kz)" 
+"Number of Subjects" "Number of Observations" 
+%do i=0 %to &kz; 
+"A&i"&_space
+%end;
+"Log-likelihood" "Akaike Information (AIC) Criterion" 
+"Schwarz (BIC) Criterion" "Hannan-Quinn (HQ) Criterion"};
+ print, "Model Fitting Information for &dep",,
+ descript [rowname=rname colname=cname];
+
+ print 'Mean and its Se of Random Effect', mean meanse; 
+ 
+ print, 'Variance and its Se of Random Effect', var varse;
+finish;
+
+       /***********************************************/
+       /*                                             */
+       /*                MAIN PROGRAM                 */
+       /*                                             */
+       /***********************************************/ 
+
+reset spaces=4;
+esp = 0.00000001;
+twopi = 8*atan(1);
+halfpi = twopi/4;
+low = -halfpi+esp;
+fact = factor(2*&kz);
+
+run getparm(parm, halfpi); 
+
+Ezp = Expzp(2*&kz+2);
+
+run getmat(Amat, Bmat, Binv, Ezp);
+
+run getdata(dep,%if &nb>0 %then %str(xvar,); npat,nobs,niobs,ystart,yend,id);
+
+con=j(2, &np, .);
+if &kz>0 then do;
+ con[1,&nb+1: &nb+&kz]=low;
+ con[2,&nb+1: &nb+&kz]=halfpi;
+end;
+con[1,&np-1] = esp; 
+con[1,&np] = esp;
+
+optn={1 0};
+
+%if &kz>0 %then %do;
+%if &method=GS %then %do;
+ con1=j(2, &np-&kz, .);
+ con1[1,&np-&kz-1] = esp; 
+ con1[1,&np-&kz] = esp;
+ if &nb=0 then
+  parm1 = parm[&np-2:&np];
+ else
+  parm1 = parm[1:&nb] // parm[&np-2:&np];
+ grid = low + (halfpi-low)*(0:(&gridpt-1))`/(&gridpt-1);
+ angle = j(&kz,1,0);
+
+ lik = .;
+
+ %do k=1 %to &kz;
+  %str(do i&k=1 to &gridpt; angle[&k]=grid[i&k];);
+ %end;
+
+  call nlpqn(rc, xr, "loglik1", parm1, optn, con1);
+ 
+  newlik = loglik1(xr`);
+  if newlik>lik then do;
+   parm=xr`;
+   lik=newlik;
+   phi=angle;
+ end;
+ %do k=1 %to &kz;
+  %str(end;);
+ %end;
+
+ if &kz>0 then do;
+  if &nb=0 then
+   parm=phi // parm[&np-&kz-2:&np-&kz];
+  else
+   parm = parm[1:&nb] // phi // parm[&np-&kz-2:&np-&kz];
+ end;
+%end;
+%else %if &method=PL %then %do;
+ con2=j(2, &np+1, .);
+
+ con2[1,&np] = esp; 
+ con2[1,&np+1] = esp;
+
+ if &kz=0 then 
+  acoef=1;
+ else
+  acoef = getacoef(binv, parm[&nb+1:&nb+&kz]);
+
+ if &nb=0 then
+  parm2 = acoef // parm[&np-2:&np];
+ else
+  parm2 = parm[1:&nb] // acoef // parm[&np-2:&np];
+
+ call nlpqn(rc, xr, "loglik2", parm2, optn, con2);
+
+ parm=xr`;
+ acoef = parm[&nb+1:&nb+&kz+1]; 
+
+ if &kz>0 then do;
+  phi=getangle(bmat, acoef);
+  if &nb=0 then
+   parm = phi // parm[&np-1:&np+1];
+  else
+   parm = parm[1:&nb] // phi // parm[&np-1:&np+1];
+ end;  
+%end;
+%end;
+
+call nlpqn(rc, xr, "loglikhd", parm, optn, con);
+
+parm = xr`;
+
+run outvalue(parm, value, newparm, vmat,stderr); 
+lambda = newparm[&nb+1:&np-1];
+mean = bmean(lambda);
+
+call nlpfdd(bm, g, h, "bmean", lambda);
+meanse = sqrt(g*vmat[&nb+1:&np-1,&nb+1:&np-1]*g`); 
+
+var = bvar(lambda);
+
+call nlpfdd(bv, g, h, "bvar", lambda);
+varse = sqrt(g*vmat[&nb+1:&np-1,&nb+1:&np-1]*g`); 
+
+%if &print^=N %then %do;
+ run outinfo(value, mean, meanse, var, varse);
+ col = {"Estimate"  "Se"  "Chisq"  "P_value"};
+ varname={%do i=1 %to &nb;
+     %let temp="%upcase(%scan(&xvar, &i))"&_space; &temp
+   %end; 
+   %do i=1 %to &kz;
+    "phi&i"&_space
+   %end; "mu" "sigb" "sige"};
+ chisq =  (newparm /stderr)##2;  
+ p_value = 1 - probchi(chisq, 1);
+ parm_se = newparm || stderr || chisq || p_value;
+ create parm_se from parm_se[rowname=varname colname=col];
+ append from parm_se[rowname=varname];
+%end; 
+
+%if %length(&outmarg)>0 %then %do;
+ varname={"x" "y"};
+ marg = margin(newparm, value[1:&kz+1], mean, var, twopi);
+ create &outmarg from marg[colname=varname];
+ append from marg;
+%end;
+
+%if %length(&outparm)>0 %then %do;
+ varname={%do i=1 %to &nb;
+     %let temp="%upcase(%scan(&xvar, &i))"&_space; &temp
+   %end; 
+   %do i=1 %to &kz;
+    "phi&i"&_space
+   %end; "mu" "sigb" "sige" 
+   %do i=0 %to &kz;
+    "a&i"&_space
+   %end; "lik" "aic" "bic" "hq" "bmean" "bvar"};
+ parm=newparm` || value` || mean || var;
+ create &outparm from parm[colname=varname];
+ append from parm;
+%end;
+
+%if %length(&outstd)>0 %then %do;
+ varname={%do i=1 %to &nb;
+    %let temp="%upcase(%scan(&xvar, &i))"&_space; &temp
+   %end;
+   %do i=1 %to &kz;
+    "phi&i"&_space
+   %end; "mu" "sigb" "sige" "bmeanse" "bvarse"};
+ parmse=stderr` || meanse || varse;
+ create &outstd from parmse[colname=varname];
+ append from parmse;  
+%end;
+
+%if %length(&outrand)>0 %then %do;
+ randeff=id || outrand(value, newparm); 
+ varname={"ID" "Effect" "SE"};
+ create &outrand from randeff[colname=varname];
+ append from randeff;
+%end;
+
+quit;
+
+%if &print^=N %then %do;
+title2 "Estimates of the Model Parameters";
+proc print data=parm_se;
+ id varname;
+ var estimate se chisq p_value;
+ format estimate se chisq 7.4 p_value 6.4;
+run;
+%end;
+
+title ' ';
+footnote ' ';
+%done: %mend slmm;
